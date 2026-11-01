@@ -22,7 +22,7 @@ them from the code.
 ```sh
 uv run ruff check .            # lint (CI gate). No `ruff format`; line-length 100, rules E,F,I,UP,B,SIM
 uv run pyright                 # typecheck (CI gate); include list in [tool.pyright]
-uv run pytest -q               # 41 tests, ~0.2s, no network
+uv run pytest -q               # 75 tests, ~0.3s, no network
 uv run python scripts/smoke.py # boots the real app on loopback: /health, /ready, 401s, handshake
 uv add <pkg>                   # edits pyproject.toml AND re-locks — commit the uv.lock change
 uv lock --check                # CI drift gate
@@ -45,15 +45,19 @@ waits for "(healthy)"; `./deploy.sh` deploys the whole stack. The unit and
   vector in `tests/test_address.py`, which is why those constants are pinned
   rather than computed by the module under test.
 - **One connection per call, handshake first.** `ElectrumClient.call` opens a
-  socket, sends `server.version` (`fulcrum-mcp/0.1.0`, protocol `1.4`), asks
-  one question and closes. There are no subscriptions: MCP is
+  socket, sends `server.version` (`fulcrum-mcp/<__version__>`, protocol `1.4`),
+  asks one question and closes. There are no subscriptions: MCP is
   request/response, so `blockchain.scripthash.subscribe` and friends are out
-  of scope, and no state is kept between calls.
+  of scope, and no state is kept between calls. A response line is capped at
+  `MAX_RESPONSE_BYTES` (8 MiB), and only a reset/aborted connect is retried.
 - Tool bodies are synchronous (`def`, not `async def`); anyio runs them on
   worker threads. `ElectrumClient` is stateless per call, so that is safe.
 - Every `@mcp.tool` passes `structured_output=False` and
   `annotations=_INDEX_TOOLS`; `tests/test_schemas.py` asserts this and the
   exact set of tool names — adding a tool means updating `TOOLS` there.
+- `_guard` raises `ToolError` rather than returning error text, so a failure
+  is `is_error=True` with the same message. A Fulcrum shape that is not what
+  the protocol promises is an error, never an empty history or a zero balance.
 - Address decoding is stdlib-only on purpose (`hashlib`, no `embit`/
   `bitcoinlib`). It validates bech32/bech32m checksums and the base58check
   checksum, and accepts mainnet/testnet/regtest prefixes without checking the
@@ -68,8 +72,9 @@ waits for "(healthy)"; `./deploy.sh` deploys the whole stack. The unit and
 - The server binds `0.0.0.0:8000` and serves `/mcp` (token-gated); `/health` is
   open and answers exactly `{"status":"ok"}`. `/ready` is also open and probes
   Fulcrum (`200` with height and blockhash, `503` when it does not answer, 2s
-  timeout); the podman healthcheck must stay on `/health`, or a syncing
-  indexer restart-loops the container.
+  timeout), cached for `READY_CACHE_TTL` (5s) because the path is open. Both
+  answer `GET`/`HEAD` only and `405` anything else; the podman healthcheck must
+  stay on `/health`, or a syncing indexer restart-loops the container.
 - The bearer-token env var is **`FULCRUM_MCP_TOKEN`**, not a shared name: each
   sibling server has its own token.
 

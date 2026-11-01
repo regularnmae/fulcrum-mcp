@@ -3,13 +3,17 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
+import time
 from collections.abc import Callable
-from typing import Any, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from address import AddressError, scripthash_for_address
 from electrum import ElectrumClient, ElectrumError
@@ -83,6 +87,14 @@ HEALTH_PATH = "/health"
 # or the container restarts in a loop while Fulcrum catches up.
 READY_PATH = "/ready"
 READY_TIMEOUT = 2.0
+# /ready is unauthenticated, and every probe opens a Fulcrum connection, so
+# the answer is cached for a few seconds: a poller hammering the path then
+# costs one indexer round trip per TTL instead of one per request.
+READY_CACHE_TTL = 5.0
+_ready_cache: tuple[float, dict[str, Any], int] | None = None
+# Created lazily, inside the running loop: an asyncio.Lock binds to the loop
+# that first awaits it, and this server has exactly one in production.
+_ready_lock: asyncio.Lock | None = None
 
 # The env var the bearer token is read from (also the name in the quadlet
 # unit's EnvironmentFile and in ~/.config/opencode/opencode.json).
@@ -95,12 +107,34 @@ _ADDRESS_HELP = (
     "taproot (bc1p...), plus the testnet and regtest prefixes."
 )
 
+# A txid is 32 bytes of hex; rejecting anything else here keeps an obvious
+# typo from becoming a round trip that Fulcrum has to say no to.
+_TXID = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{64}$")]
+
 
 def _render(result: Any) -> str:
     """A tool result as text: a bare string as-is, anything else as JSON."""
     if isinstance(result, str):
         return result
     return json.dumps(result, indent=2)
+
+
+def _int_field(value: Any, what: str) -> int:
+    """A field Fulcrum promised, or an error naming what was missing.
+
+    `bool` is excluded on purpose: it is an `int` subclass, and a JSON
+    `true` where a balance belongs is a malformed answer, not a one-satoshi
+    balance.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ElectrumError(f"Fulcrum returned an unexpected {what}")
+    return value
+
+
+def _str_field(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ElectrumError(f"Fulcrum returned an unexpected {what}")
+    return value
 
 
 def _error_text(err: ElectrumError) -> str:
@@ -110,22 +144,26 @@ def _error_text(err: ElectrumError) -> str:
 
 
 def _guard(label: str, action: Callable[[], Any]) -> str:
-    """Run a tool body, turning its known failures into text.
+    """Run a tool body, turning its known failures into a tool error.
 
     `label` is the Electrum method (or the intent) that failed, so a log line
     names what broke without every tool repeating the same four `except`
-    clauses.
+    clauses. Failures raise `ToolError`, which the SDK returns as
+    `is_error=True` with the same text the model would otherwise have read --
+    so a client can tell a failed lookup from an address with no history.
     """
     try:
         return _render(action())
     except AddressError as err:
-        return f"{err}. {_ADDRESS_HELP}"
+        raise ToolError(f"{err}. {_ADDRESS_HELP}") from err
     except ElectrumError as err:
         logger.warning("%s failed: %s", label, err.message)
-        return _error_text(err)
+        raise ToolError(_error_text(err)) from err
+    except ToolError:
+        raise
     except Exception as err:  # noqa: BLE001 - surfaced as text, never hidden
         logger.exception("unexpected error in %s", label)
-        return f"Unexpected error calling {label}: {err}"
+        raise ToolError(f"Unexpected error calling {label}: {err}") from err
 
 
 def _header_fields(hexstring: Any) -> tuple[str, int]:
@@ -134,8 +172,8 @@ def _header_fields(hexstring: Any) -> tuple[str, int]:
         raw = bytes.fromhex(hexstring or "")
     except (TypeError, ValueError) as err:
         raise ElectrumError("Fulcrum returned a malformed block header") from err
-    if len(raw) < 80:
-        raise ElectrumError("Fulcrum returned a short block header")
+    if len(raw) != 80:
+        raise ElectrumError("Fulcrum returned a malformed block header")
     blockhash = hashlib.sha256(hashlib.sha256(raw[:80]).digest()).digest()[::-1].hex()
     return blockhash, int.from_bytes(raw[68:72], "little")
 
@@ -148,60 +186,93 @@ def _balance(address: str) -> dict[str, Any]:
     return {
         "address": address,
         "scripthash": script_hash,
-        "confirmed": result.get("confirmed", 0),
-        "unconfirmed": result.get("unconfirmed", 0),
+        "confirmed": _int_field(result.get("confirmed"), "confirmed balance"),
+        "unconfirmed": _int_field(result.get("unconfirmed"), "unconfirmed balance"),
         "unit": "satoshi",
     }
 
 
-def _history(address: str) -> dict[str, Any]:
+def _history(address: str, limit: int, offset: int) -> dict[str, Any]:
     script_hash = scripthash_for_address(address)
     rows = client.call("blockchain.scripthash.get_history", [script_hash])
+    if not isinstance(rows, list):
+        raise ElectrumError("Fulcrum returned an unexpected history")
     confirmed: list[dict[str, Any]] = []
     mempool: list[dict[str, Any]] = []
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         if not isinstance(row, dict):
-            continue
-        height = row.get("height")
-        entry = {"txid": row.get("tx_hash"), "height": height}
-        if isinstance(height, int) and height > 0:
+            raise ElectrumError("Fulcrum returned an unexpected history entry")
+        height = _int_field(row.get("height"), "history height")
+        entry = {"txid": _str_field(row.get("tx_hash"), "history txid"), "height": height}
+        if height > 0:
             confirmed.append(entry)
         else:
             mempool.append(entry)
+    page = confirmed[offset : offset + limit]
+    next_offset = offset + len(page)
     return {
         "address": address,
         "scripthash": script_hash,
-        "confirmed": confirmed,
+        "confirmed": page,
         "mempool": mempool,
         "confirmed_count": len(confirmed),
         "mempool_count": len(mempool),
+        "returned": len(page),
+        "next_offset": next_offset if next_offset < len(confirmed) else None,
     }
 
 
 def _utxos(address: str) -> dict[str, Any]:
     script_hash = scripthash_for_address(address)
     rows = client.call("blockchain.scripthash.listunspent", [script_hash])
+    if not isinstance(rows, list):
+        raise ElectrumError("Fulcrum returned an unexpected utxo list")
     utxos = []
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         if not isinstance(row, dict):
-            continue
-        height = row.get("height")
+            raise ElectrumError("Fulcrum returned an unexpected utxo entry")
+        height = _int_field(row.get("height"), "utxo height")
         utxos.append(
             {
-                "txid": row.get("tx_hash"),
-                "vout": row.get("tx_pos"),
+                "txid": _str_field(row.get("tx_hash"), "utxo txid"),
+                "vout": _int_field(row.get("tx_pos"), "utxo position"),
                 "height": height,
-                "value": row.get("value"),
-                "confirmed": isinstance(height, int) and height > 0,
+                "value": _int_field(row.get("value"), "utxo value"),
+                "confirmed": height > 0,
             }
         )
-    total = sum(u["value"] for u in utxos if isinstance(u["value"], int))
     return {
         "address": address,
         "scripthash": script_hash,
         "utxos": utxos,
         "count": len(utxos),
-        "total": total,
+        "total": sum(utxo["value"] for utxo in utxos),
+        "unit": "satoshi",
+    }
+
+
+def _mempool(address: str) -> dict[str, Any]:
+    script_hash = scripthash_for_address(address)
+    rows = client.call("blockchain.scripthash.get_mempool", [script_hash])
+    if not isinstance(rows, list):
+        raise ElectrumError("Fulcrum returned an unexpected mempool")
+    transactions = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ElectrumError("Fulcrum returned an unexpected mempool entry")
+        transactions.append(
+            {
+                "txid": _str_field(row.get("tx_hash"), "mempool txid"),
+                "height": _int_field(row.get("height"), "mempool height"),
+                "fee": _int_field(row.get("fee"), "mempool fee"),
+            }
+        )
+    return {
+        "address": address,
+        "scripthash": script_hash,
+        "transactions": transactions,
+        "count": len(transactions),
+        "total_fee": sum(transaction["fee"] for transaction in transactions),
         "unit": "satoshi",
     }
 
@@ -210,8 +281,53 @@ def _chain_tip() -> dict[str, Any]:
     header = client.call("blockchain.headers.subscribe", [])
     if not isinstance(header, dict):
         raise ElectrumError("Fulcrum returned an unexpected block header")
+    height = _int_field(header.get("height"), "tip height")
     blockhash, timestamp = _header_fields(header.get("hex"))
-    return {"height": header.get("height"), "blockhash": blockhash, "time": timestamp}
+    return {"height": height, "blockhash": blockhash, "time": timestamp}
+
+
+def _block_header(height: int) -> dict[str, Any]:
+    hexstring = client.call("blockchain.block.header", [height])
+    blockhash, timestamp = _header_fields(hexstring)
+    return {"height": height, "blockhash": blockhash, "time": timestamp, "header": hexstring}
+
+
+def _transaction_merkle(txid: str, height: int) -> dict[str, Any]:
+    result = client.call("blockchain.transaction.get_merkle", [txid, height])
+    if not isinstance(result, dict):
+        raise ElectrumError("Fulcrum returned an unexpected merkle proof")
+    merkle = result.get("merkle")
+    if not isinstance(merkle, list):
+        raise ElectrumError("Fulcrum returned an unexpected merkle proof")
+    return {
+        "txid": txid,
+        "block_height": _int_field(result.get("block_height"), "merkle block height"),
+        "pos": _int_field(result.get("pos"), "merkle position"),
+        "merkle": merkle,
+    }
+
+
+def _fee_estimate(blocks: int) -> dict[str, Any]:
+    estimate = client.call("blockchain.estimatefee", [blocks])
+    if (
+        isinstance(estimate, bool)
+        or not isinstance(estimate, (int, float))
+        or not math.isfinite(estimate)
+    ):
+        raise ElectrumError("Fulcrum returned an unexpected fee estimate")
+    if estimate < 0:
+        return {
+            "blocks": blocks,
+            "btc_per_kvb": None,
+            "sat_per_vb": None,
+            "note": "Fulcrum has no estimate for this target",
+        }
+    # Electrum quotes BTC per 1000 virtual bytes; 1e8 sat/BTC / 1000 vB is 1e5.
+    return {
+        "blocks": blocks,
+        "btc_per_kvb": estimate,
+        "sat_per_vb": round(estimate * 100_000, 3),
+    }
 
 
 @mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
@@ -229,18 +345,32 @@ def get_address_balance(address: str) -> str:
 
 
 @mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
-def get_address_history(address: str) -> str:
-    """Return every transaction an address has touched.
+def get_address_history(
+    address: str,
+    limit: Annotated[int, Field(ge=1, le=10000)] = 1000,
+    offset: Annotated[int, Field(ge=0)] = 0,
+) -> str:
+    """Return the transactions an address has touched, one page at a time.
 
     This is the question a plain node cannot answer: bitcoind keeps no
     address index. Entries carry the txid and the height it was mined at;
     height 0 is an unconfirmed mempool transaction and -1 an unconfirmed
-    one with unconfirmed parents. `confirmed` is ordered oldest first.
+    one with unconfirmed parents. `confirmed` is ordered oldest first and
+    paginated by `limit`/`offset`; `mempool` is always returned whole.
+
+    `confirmed_count` is the total mined history, not the size of this page.
+    When `next_offset` is not null, call again with it as `offset` to read
+    the rest.
 
     Args:
         address: A bitcoin address, e.g. bc1q... or 1....
+        limit: Maximum confirmed entries to return (1-10000, default 1000).
+        offset: Index of the first confirmed entry to return (default 0).
     """
-    return _guard("blockchain.scripthash.get_history", lambda: _history(address))
+    return _guard(
+        "blockchain.scripthash.get_history",
+        lambda: _history(address, limit, offset),
+    )
 
 
 @mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
@@ -257,7 +387,22 @@ def get_address_utxos(address: str) -> str:
 
 
 @mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
-def get_transaction(txid: str, verbose: bool = True) -> str:
+def get_address_mempool(address: str) -> str:
+    """Return an address's unconfirmed transactions, with the fee each pays.
+
+    `get_address_history` names the mempool transactions an address has
+    touched; this adds the fee (in satoshis) Fulcrum attributes to each one,
+    which is what tells a stuck payment from a well-priced one. Height 0 is
+    an unconfirmed transaction and -1 one with unconfirmed parents.
+
+    Args:
+        address: A bitcoin address, e.g. bc1q... or 1....
+    """
+    return _guard("blockchain.scripthash.get_mempool", lambda: _mempool(address))
+
+
+@mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
+def get_transaction(txid: _TXID, verbose: bool = True) -> str:
     """Return a transaction by id, from Fulcrum's own index.
 
     Fulcrum indexes every transaction it has seen, so this resolves a
@@ -271,7 +416,26 @@ def get_transaction(txid: str, verbose: bool = True) -> str:
     """
     return _guard(
         "blockchain.transaction.get",
-        lambda: client.call("blockchain.transaction.get", [txid, verbose]),
+        lambda: client.call("blockchain.transaction.get", [txid.lower(), verbose]),
+    )
+
+
+@mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
+def get_transaction_merkle(txid: _TXID, height: Annotated[int, Field(ge=0)]) -> str:
+    """Return a transaction's merkle branch in the block at `height`.
+
+    This is the proof that a transaction is in a block, and it also confirms
+    which block: `pos` is its position in that block's transaction list. The
+    protocol has no txid-to-height lookup, so take `height` from
+    `get_address_history` (or a block you already know).
+
+    Args:
+        txid: Transaction id (hex).
+        height: Height of the block the transaction was mined in.
+    """
+    return _guard(
+        "blockchain.transaction.get_merkle",
+        lambda: _transaction_merkle(txid.lower(), height),
     )
 
 
@@ -286,6 +450,35 @@ def get_chain_tip() -> str:
 
 
 @mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
+def get_block_header(height: Annotated[int, Field(ge=0)]) -> str:
+    """Return a block's hash, timestamp and raw 80-byte header, by height.
+
+    Use this to date a transaction's block (the height comes from
+    `get_address_history`) without trusting the current tip, or to check a
+    header's proof of work from the `header` hex it returns.
+
+    Args:
+        height: Block height, where 0 is the genesis block.
+    """
+    return _guard("blockchain.block.header", lambda: _block_header(height))
+
+
+@mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
+def get_fee_estimate(blocks: Annotated[int, Field(ge=1, le=1008)] = 2) -> str:
+    """Return Fulcrum's fee estimate for confirmation within `blocks`.
+
+    The estimate is quoted in both units Fulcrum's protocol and a wallet use:
+    `btc_per_kvb` as Electrum returns it, and `sat_per_vb` converted for
+    reading. A target with no estimate answers with nulls and a note rather
+    than a made-up number.
+
+    Args:
+        blocks: Confirmation target in blocks (1-1008, default 2).
+    """
+    return _guard("blockchain.estimatefee", lambda: _fee_estimate(blocks))
+
+
+@mcp.tool(structured_output=False, annotations=_INDEX_TOOLS)
 def get_server_info() -> str:
     """Return the server's features: version, genesis hash, protocol range.
 
@@ -296,7 +489,28 @@ def get_server_info() -> str:
 
 
 async def _readiness() -> tuple[dict[str, Any], int]:
-    """Probe Fulcrum for `/ready`, off the event loop with a short timeout.
+    """`/ready`'s answer, cached for READY_CACHE_TTL seconds.
+
+    The path is unauthenticated, so without the cache any LAN host could
+    turn one HTTP request into one Fulcrum connection. The cache is a plain
+    module global: a stale-by-five-seconds tip is still the right answer for
+    a readiness probe. The lock means a burst of concurrent requests produces
+    one probe rather than one each; the later callers read its answer.
+    """
+    global _ready_cache, _ready_lock
+    if _ready_lock is None:
+        _ready_lock = asyncio.Lock()
+    async with _ready_lock:
+        cached = _ready_cache
+        if cached is not None and time.monotonic() - cached[0] < READY_CACHE_TTL:
+            return cached[1], cached[2]
+        body, status_code = await _probe_readiness()
+        _ready_cache = (time.monotonic(), body, status_code)
+        return body, status_code
+
+
+async def _probe_readiness() -> tuple[dict[str, Any], int]:
+    """Ask Fulcrum for its tip, off the event loop with a short timeout.
 
     Returns the JSON body and status code: 200 with the served tip when
     Fulcrum answers, 503 with the reason when it does not.
@@ -320,6 +534,25 @@ async def _readiness() -> tuple[dict[str, Any], int]:
     return {"status": "ready", "height": tip.get("height"), "blockhash": blockhash}, 200
 
 
+async def _json_response(
+    scope: Any,
+    receive: Any,
+    send: Any,
+    body: dict[str, Any],
+    status_code: int,
+    headers: dict[str, str] | None = None,
+) -> None:
+    """Send one JSON response, with no body for a HEAD request."""
+    from starlette.responses import JSONResponse
+
+    response = JSONResponse(body, status_code=status_code, headers=headers)
+    if scope.get("method") == "HEAD":
+        # JSONResponse has already set Content-Length for the body it would
+        # have sent; HEAD promises the headers and no body.
+        response.body = b""
+    await response(scope, receive, send)
+
+
 class BearerAuthMiddleware:
     """Pure-ASGI bearer auth in front of the streamable-HTTP app.
 
@@ -332,6 +565,8 @@ class BearerAuthMiddleware:
     GET /health stays unauthenticated so a poller can say "up" without
     holding the token; it says nothing else. GET /ready does the same and
     adds whether Fulcrum answers, on a short timeout, for the same reason.
+    Both answer only GET and HEAD -- a write method on a status path is a
+    client bug, not something to answer 200 to.
     """
 
     def __init__(self, app: Any, token: str | None) -> None:
@@ -354,26 +589,28 @@ class BearerAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        if scope.get("path") == HEALTH_PATH:
-            from starlette.responses import JSONResponse
-
-            response = JSONResponse({"status": "ok"})
-            await response(scope, receive, send)
-            return
-
-        if scope.get("path") == READY_PATH:
-            from starlette.responses import JSONResponse
-
+        if scope.get("path") in (HEALTH_PATH, READY_PATH):
+            if scope.get("method") not in ("GET", "HEAD"):
+                await _json_response(
+                    scope,
+                    receive,
+                    send,
+                    {"error": "method not allowed"},
+                    405,
+                    {"allow": "GET, HEAD"},
+                )
+                return
+            if scope.get("path") == HEALTH_PATH:
+                await _json_response(scope, receive, send, {"status": "ok"}, 200)
+                return
             body, status_code = await _readiness()
-            response = JSONResponse(body, status_code=status_code)
-            await response(scope, receive, send)
+            await _json_response(scope, receive, send, body, status_code)
             return
 
         if self.token and not self._authorised(scope):
-            from starlette.responses import JSONResponse
-
-            response = JSONResponse({"error": "unauthorized"}, status_code=401)
-            await response(scope, receive, send)
+            await _json_response(
+                scope, receive, send, {"error": "unauthorized"}, 401
+            )
             return
 
         await self.app(scope, receive, send)

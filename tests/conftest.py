@@ -77,3 +77,20 @@ def call(client: Client) -> Callable[..., Any]:
         return result.content[0].text  # type: ignore[union-attr]
 
     return _call
+
+
+@pytest.fixture
+def error_call(client: Client) -> Callable[..., Any]:
+    """Call a tool that is expected to fail, and return its error text.
+
+    A failure is an `is_error=True` result rather than a successful one, so
+    a client can tell "the indexer did not answer" from "this address has no
+    history".
+    """
+
+    async def _call(name: str, **arguments: Any) -> str:
+        result = await client.call_tool(name, arguments)
+        assert result.is_error, f"tool {name} succeeded, want a tool error"
+        return result.content[0].text  # type: ignore[union-attr]
+
+    return _call

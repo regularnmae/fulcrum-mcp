@@ -33,10 +33,18 @@ class _Stream:
     def flush(self) -> None:
         pass
 
-    def readline(self) -> bytes:
+    def readline(self, limit: int = -1) -> bytes:
         if self.read_error is not None:
             raise self.read_error
-        return self.responses.pop(0) if self.responses else b""
+        if not self.responses:
+            return b""
+        line = self.responses.pop(0)
+        if limit >= 0 and len(line) > limit:
+            # Emulate a buffered reader: hand back the prefix and keep the
+            # rest for a next read the client will not make.
+            self.responses.insert(0, line[limit:])
+            return line[:limit]
+        return line
 
     def close(self) -> None:
         self.closed = True
@@ -134,6 +142,72 @@ def test_url_parsing_covers_both_schemes() -> None:
         parse_url("http://fulcrum:50001")
     with pytest.raises(ValueError):
         parse_url("tcp://")
+
+
+def test_url_parsing_rejects_parts_the_socket_would_drop() -> None:
+    for url in (
+        "tcp://fulcrum:50001/electrum",
+        "tcp://fulcrum:50001?timeout=1",
+        "tcp://fulcrum:50001#fragment",
+        "ssl://user:pass@fulcrum:50002",
+    ):
+        with pytest.raises(ValueError):
+            parse_url(url)
+
+
+def test_a_line_over_the_cap_is_refused(monkeypatch) -> None:
+    # 64 is above the handshake line and below the oversized answer, so the
+    # cap is exercised on the answer rather than on server.version.
+    monkeypatch.setattr(electrum_module, "MAX_RESPONSE_BYTES", 64)
+    _install(monkeypatch, [HANDSHAKE, b'{"result":"' + b"x" * 64 + b'"}\n'])
+    with pytest.raises(ElectrumError) as excinfo:
+        ElectrumClient(URL).call("server.features")
+    assert "exceeded 64 bytes" in excinfo.value.message
+
+
+def test_a_line_without_a_newline_is_refused(monkeypatch) -> None:
+    _install(monkeypatch, [HANDSHAKE, b'{"id":1,"result":1}'])
+    with pytest.raises(ElectrumError) as excinfo:
+        ElectrumClient(URL).call("server.features")
+    assert "not newline-terminated" in excinfo.value.message
+
+
+def test_a_reset_connect_is_retried_once(monkeypatch) -> None:
+    stream = _Stream([HANDSHAKE, b'{"id":1,"result":1}\n'])
+    attempts: list[int] = []
+
+    def fake_create_connection(address, timeout=None):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ConnectionResetError(104, "reset")
+        return _Sock(stream)
+
+    monkeypatch.setattr(electrum_module.socket, "create_connection", fake_create_connection)
+    monkeypatch.setattr(electrum_module.time, "sleep", lambda _seconds: None)
+    assert ElectrumClient(URL).call("server.features") == 1
+    assert len(attempts) == 2
+
+
+def test_a_refused_connect_is_not_retried(monkeypatch) -> None:
+    attempts: list[int] = []
+
+    def fake_create_connection(address, timeout=None):
+        attempts.append(1)
+        raise ConnectionRefusedError(111, "refused")
+
+    monkeypatch.setattr(electrum_module.socket, "create_connection", fake_create_connection)
+    with pytest.raises(ElectrumError):
+        ElectrumClient(URL).call("server.features")
+    assert len(attempts) == 1
+
+
+def test_the_client_name_tracks_the_manifest_version() -> None:
+    import tomllib
+    from pathlib import Path
+
+    version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+    assert electrum_module.__version__ == version
+    assert f"fulcrum-mcp/{version}" == electrum_module.CLIENT_NAME
 
 
 def test_the_per_call_timeout_overrides_the_default(monkeypatch) -> None:

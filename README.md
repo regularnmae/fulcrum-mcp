@@ -10,20 +10,32 @@ It exists because a node cannot answer the address question. `bitcoind` keeps
 no address index, so "which transactions touched this address" needs an
 indexer beside it; Fulcrum is that indexer, and this server is its MCP face.
 
-Six tools, all read-only:
+Ten tools, all read-only:
 
 | Tool | What it does |
 | --- | --- |
 | `get_address_balance` | Confirmed and unconfirmed balance, in satoshis |
-| `get_address_history` | Every transaction the address touched, with heights |
+| `get_address_history` | The transactions the address touched, paginated, with heights |
 | `get_address_utxos` | Unspent outputs with height and value, and their total |
+| `get_address_mempool` | Unconfirmed transactions and the fee each pays |
 | `get_transaction` | A transaction by id, decoded or hex, from Fulcrum's index |
+| `get_transaction_merkle` | A transaction's merkle branch in a block |
+| `get_block_header` | A block's hash, time and raw header, by height |
 | `get_chain_tip` | The height, hash and time of the block Fulcrum is serving |
+| `get_fee_estimate` | Fulcrum's estimate in BTC/kvB and sat/vB |
 | `get_server_info` | Fulcrum's version, genesis hash, protocol range and hosts |
 
 Each tool returns text — a scalar as-is, an object as pretty-printed JSON.
 They are all marked read-only and open-world, so a well-behaved client skips
-the confirmation prompt.
+the confirmation prompt. A failed lookup comes back as a tool error
+(`is_error=True`) with the same readable message, so a client can tell "the
+indexer did not answer" from "this address has no history" — the distinction
+matters most here, where an empty history is a legitimate answer.
+
+`get_address_history` returns up to `limit` (default 1000) mined entries from
+`offset`, with `confirmed_count` for the total and `next_offset` when there
+is more; the mempool list is always whole. The cap keeps a heavily used
+address from filling a client's context window in one call.
 
 ## The indexer
 
@@ -71,7 +83,10 @@ It listens on `0.0.0.0:8000` and serves streamable HTTP at `/mcp`. `GET
 /health` is unauthenticated and answers `{"status":"ok"}` — nothing more, so a
 poller can say "up" without holding the token. `GET /ready` is open too and
 adds Fulcrum's answer: `200` with `height` and `blockhash`, or `503` with the
-reason, probed on a 2-second timeout.
+reason, probed on a 2-second timeout. The readiness answer is cached for five
+seconds, so a poller cannot turn one unauthenticated request into one
+connection to the indexer. Both paths answer `GET` and `HEAD`; any other
+method is a `405`.
 
 Keep the container healthcheck on `/health`. `/ready` stays `503` while
 Fulcrum syncs or is down, so gating podman on it would restart this server in
@@ -118,7 +133,7 @@ Dependencies are managed with [uv](https://docs.astral.sh/uv/) from
 `pyproject.toml`; `uv.lock` is the exact closure (versions *and* hashes).
 
 ```sh
-uv run pytest -q                # 41 tests, ~0.2s, no network
+uv run pytest -q                # 75 tests, ~0.3s, no network
 uv run ruff check .             # lint
 uv run pyright                  # typecheck
 uv run python scripts/smoke.py  # boots the real app on loopback
@@ -149,8 +164,9 @@ def my_tool(address: str) -> str:
 
 `structured_output=False` keeps a text result from being sent twice;
 `_INDEX_TOOLS` marks it read-only so clients skip the confirmation prompt; and
-`_guard` turns an `AddressError` or `ElectrumError` into readable text rather
-than a traceback. Adding a tool also means adding its name to `TOOLS` in
+`_guard` turns an `AddressError` or `ElectrumError` into a `ToolError`, which
+the SDK returns as `is_error=True` with the readable message rather than a
+traceback. Adding a tool also means adding its name to `TOOLS` in
 `tests/test_schemas.py`; a new top-level module must be added to the
 `Containerfile`'s `COPY` lines and pyright's `include`, or it will not ship or
 typecheck.

@@ -70,8 +70,8 @@ async def test_utxos_are_totalled_in_satoshis(call, fake_client) -> None:
 
 
 @pytest.mark.anyio
-async def test_an_invalid_address_lists_what_is_accepted(call, fake_client) -> None:
-    text = await call("get_address_balance", address="1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN3")
+async def test_an_invalid_address_lists_what_is_accepted(error_call, fake_client) -> None:
+    text = await error_call("get_address_balance", address="1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN3")
     assert "checksum" in text
     assert "Accepted:" in text
     assert fake_client.calls == []  # nothing was asked of the indexer
@@ -109,10 +109,133 @@ async def test_server_info_is_returned_as_json(call, fake_client) -> None:
 
 
 @pytest.mark.anyio
-async def test_an_electrum_error_is_surfaced_with_its_code(call, fake_client) -> None:
+async def test_an_electrum_error_is_surfaced_with_its_code(error_call, fake_client) -> None:
     fake_client.answers["blockchain.transaction.get"] = ElectrumError(
         "daemon error: No such mempool or blockchain transaction", 2
     )
-    text = await call("get_transaction", txid="ab" * 32)
+    text = await error_call("get_transaction", txid="ab" * 32)
     assert "No such mempool" in text
     assert "electrum error 2" in text
+
+
+@pytest.mark.anyio
+async def test_a_balance_without_its_fields_is_an_error(error_call, fake_client) -> None:
+    # An unexpected shape must not read as "zero balance": the model would
+    # otherwise report a funded address as empty.
+    fake_client.answers["blockchain.scripthash.get_balance"] = {"confirmed": 1}
+    text = await error_call("get_address_balance", address=P2WPKH)
+    assert "unexpected" in text
+    assert "unconfirmed balance" in text
+
+
+@pytest.mark.anyio
+async def test_a_history_that_is_not_a_list_is_an_error(error_call, fake_client) -> None:
+    fake_client.answers["blockchain.scripthash.get_history"] = None
+    text = await error_call("get_address_history", address=P2WPKH)
+    assert "unexpected history" in text
+
+
+@pytest.mark.anyio
+async def test_a_utxo_without_its_value_is_an_error(error_call, fake_client) -> None:
+    fake_client.answers["blockchain.scripthash.listunspent"] = [
+        {"tx_hash": "aa" * 32, "tx_pos": 0, "height": 800000}
+    ]
+    text = await error_call("get_address_utxos", address=P2WPKH)
+    assert "utxo value" in text
+
+
+@pytest.mark.anyio
+async def test_history_is_paginated_with_a_next_offset(call, fake_client) -> None:
+    fake_client.answers["blockchain.scripthash.get_history"] = [
+        {"tx_hash": f"{n:064x}", "height": 800000 + n} for n in range(3)
+    ]
+    first = json.loads(await call("get_address_history", address=P2WPKH, limit=2))
+    assert first["confirmed_count"] == 3
+    assert first["returned"] == 2
+    assert first["next_offset"] == 2
+
+    second = json.loads(
+        await call("get_address_history", address=P2WPKH, limit=2, offset=2)
+    )
+    assert second["returned"] == 1
+    assert second["next_offset"] is None
+    assert second["confirmed"][0]["height"] == 800002
+
+
+@pytest.mark.anyio
+async def test_mempool_transactions_carry_their_fee(call, fake_client) -> None:
+    fake_client.answers["blockchain.scripthash.get_mempool"] = [
+        {"tx_hash": "aa" * 32, "height": 0, "fee": 1500},
+        {"tx_hash": "bb" * 32, "height": -1, "fee": 500},
+    ]
+    payload = json.loads(await call("get_address_mempool", address=P2WPKH))
+    assert payload["count"] == 2
+    assert payload["total_fee"] == 2000
+    assert payload["unit"] == "satoshi"
+    assert fake_client.calls == [
+        ("blockchain.scripthash.get_mempool", [scripthash_for_address(P2WPKH)])
+    ]
+
+
+@pytest.mark.anyio
+async def test_block_header_is_derived_from_its_hex(call, fake_client) -> None:
+    fake_client.answers["blockchain.block.header"] = GENESIS_HEADER
+    payload = json.loads(await call("get_block_header", height=0))
+    assert payload["blockhash"] == GENESIS_HASH
+    assert payload["time"] == 1231006505
+    assert payload["header"] == GENESIS_HEADER
+
+
+@pytest.mark.anyio
+async def test_a_header_that_is_not_80_bytes_is_an_error(error_call, fake_client) -> None:
+    fake_client.answers["blockchain.block.header"] = "00" * 79
+    text = await error_call("get_block_header", height=1)
+    assert "malformed block header" in text
+
+
+@pytest.mark.anyio
+async def test_merkle_proof_is_forwarded_with_its_height(call, fake_client) -> None:
+    fake_client.answers["blockchain.transaction.get_merkle"] = {
+        "block_height": 800000,
+        "merkle": ["aa" * 32, "bb" * 32],
+        "pos": 7,
+    }
+    payload = json.loads(
+        await call("get_transaction_merkle", txid="AB" * 32, height=800000)
+    )
+    assert payload["txid"] == "ab" * 32
+    assert payload["pos"] == 7
+    assert fake_client.calls == [
+        ("blockchain.transaction.get_merkle", ["ab" * 32, 800000])
+    ]
+
+
+@pytest.mark.anyio
+async def test_fee_estimate_is_converted_to_sat_per_vb(call, fake_client) -> None:
+    fake_client.answers["blockchain.estimatefee"] = 0.0001
+    payload = json.loads(await call("get_fee_estimate", blocks=6))
+    assert payload["btc_per_kvb"] == 0.0001
+    assert payload["sat_per_vb"] == 10.0
+    assert fake_client.calls == [("blockchain.estimatefee", [6])]
+
+
+@pytest.mark.anyio
+async def test_no_fee_estimate_is_reported_not_invented(call, fake_client) -> None:
+    fake_client.answers["blockchain.estimatefee"] = -1
+    payload = json.loads(await call("get_fee_estimate"))
+    assert payload["sat_per_vb"] is None
+    assert "no estimate" in payload["note"]
+
+
+@pytest.mark.anyio
+async def test_a_non_finite_fee_estimate_is_an_error(error_call, fake_client) -> None:
+    fake_client.answers["blockchain.estimatefee"] = float("nan")
+    text = await error_call("get_fee_estimate")
+    assert "unexpected fee estimate" in text
+
+
+@pytest.mark.anyio
+async def test_a_malformed_txid_never_reaches_the_indexer(error_call, fake_client) -> None:
+    text = await error_call("get_transaction", txid="not-a-txid")
+    assert "txid" in text
+    assert fake_client.calls == []

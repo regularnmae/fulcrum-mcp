@@ -78,6 +78,11 @@ def main() -> int:
         if status != 200:
             failures.append(f"/health returned {status}, want 200")
 
+        # A status path answers reads only; a write method is a client bug.
+        status, _ = request(f"{base}/health", method="POST", body=b"{}")
+        if status != 405:
+            failures.append(f"POST /health returned {status}, want 405")
+
         # Liveness and readiness differ on purpose: the process is up while
         # the (deliberately unreachable) indexer is down, so /ready is 503.
         status, body = request(f"{base}/ready")
@@ -107,7 +112,10 @@ def main() -> int:
             for line in failures:
                 print("FAIL:", line)
             return 1
-        print("smoke: health open, ready 503 without an indexer, mcp gated, handshake ok")
+        print(
+            "smoke: health open (GET only), ready 503 without an indexer, "
+            "mcp gated, handshake ok"
+        )
         return 0
     finally:
         process.terminate()

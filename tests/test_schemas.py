@@ -18,9 +18,13 @@ import server
 TOOLS = {
     "get_address_balance",
     "get_address_history",
+    "get_address_mempool",
     "get_address_utxos",
     "get_transaction",
+    "get_transaction_merkle",
+    "get_block_header",
     "get_chain_tip",
+    "get_fee_estimate",
     "get_server_info",
 }
 
@@ -57,7 +61,25 @@ def test_every_tool_declares_itself_read_only(advertised: dict) -> None:
 
 
 def test_address_arguments_are_required_strings(advertised: dict) -> None:
-    for name in ("get_address_balance", "get_address_history", "get_address_utxos"):
+    for name in (
+        "get_address_balance",
+        "get_address_history",
+        "get_address_mempool",
+        "get_address_utxos",
+    ):
         schema = advertised[name].input_schema
         assert schema["required"] == ["address"], name
         assert schema["properties"]["address"]["type"] == "string", name
+
+
+def test_txid_arguments_are_64_hex_characters(advertised: dict) -> None:
+    for name in ("get_transaction", "get_transaction_merkle"):
+        schema = advertised[name].input_schema
+        assert schema["properties"]["txid"]["pattern"] == "^[0-9a-fA-F]{64}$", name
+
+
+def test_history_pagination_is_bounded(advertised: dict) -> None:
+    properties = advertised["get_address_history"].input_schema["properties"]
+    assert properties["limit"]["maximum"] == 10000
+    assert properties["limit"]["minimum"] == 1
+    assert properties["offset"]["minimum"] == 0
