@@ -56,10 +56,14 @@ mcp = MCPServer(
         "chain by address -- something a Bitcoin node cannot do. The address "
         "tools take an ordinary address and decode it to the scripthash "
         "Fulcrum indexes; get_address_history is the one question bitcoind "
-        "cannot answer. get_transaction reads Fulcrum's own transaction "
-        "index, so it does not depend on txindex on the node behind it. "
-        "Start with get_chain_tip for the server's height. Nothing here "
-        "moves funds or changes the chain."
+        "cannot answer, and it pages a long history. get_address_mempool "
+        "adds the fee each unconfirmed transaction pays. get_transaction "
+        "reads Fulcrum's own transaction index, so it does not depend on "
+        "txindex on the node behind it; get_transaction_merkle proves a "
+        "transaction is in a block, and get_block_header dates that block. "
+        "get_fee_estimate quotes Fulcrum's fee estimate. Start with "
+        "get_chain_tip for the server's height. Nothing here moves funds or "
+        "changes the chain."
     ),
     log_level=_log_level(),
 )

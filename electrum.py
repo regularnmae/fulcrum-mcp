@@ -16,6 +16,7 @@ one.
 import json
 import socket
 import ssl
+import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -36,6 +37,13 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 # A connect that is reset or aborted is worth one more try; a read timeout is
 # not, because that call has already spent its whole timeout budget.
 CONNECT_RETRY_DELAY = 0.1
+
+# Tool calls run on worker threads and each one opens a socket, so a client
+# that fans out can otherwise put an unbounded number of connections on the
+# indexer. A caller waits briefly for a slot and is shed with an error after
+# that rather than queueing forever.
+MAX_CONCURRENT_CALLS = 8
+CALL_SLOT_TIMEOUT = 5.0
 
 
 class ElectrumError(Exception):
@@ -81,6 +89,7 @@ class ElectrumClient:
     def __init__(self, url: str, timeout: float = DEFAULT_TIMEOUT) -> None:
         self._url, self._host, self._port, self._tls = parse_url(url)
         self._timeout = timeout
+        self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_CALLS)
 
     def call(
         self, method: str, params: list[Any] | None = None, timeout: float | None = None
@@ -88,8 +97,25 @@ class ElectrumClient:
         """Invoke `method`, returning `result` or raising `ElectrumError`.
 
         `timeout` overrides the endpoint timeout for this one call, which is
-        what a readiness probe wants.
+        what a readiness probe wants. A caller takes one of
+        `MAX_CONCURRENT_CALLS` slots first, so a fan-out is shed with an error
+        instead of opening an unbounded number of sockets.
         """
+        # A per-call timeout (the readiness probe's 2s) also caps the wait for
+        # a slot, so a probe cannot outlive its own deadline in the queue.
+        slot_timeout = CALL_SLOT_TIMEOUT if timeout is None else min(CALL_SLOT_TIMEOUT, timeout)
+        if not self._slots.acquire(timeout=slot_timeout):
+            raise ElectrumError(
+                f"Fulcrum is busy: {MAX_CONCURRENT_CALLS} calls are already in flight"
+            )
+        try:
+            return self._call(method, params, timeout)
+        finally:
+            self._slots.release()
+
+    def _call(
+        self, method: str, params: list[Any] | None, timeout: float | None
+    ) -> Any:
         effective_timeout = self._timeout if timeout is None else timeout
         try:
             sock = self._connect(effective_timeout)
@@ -158,6 +184,10 @@ class ElectrumClient:
             raise ElectrumError("Fulcrum returned a non-JSON line") from err
         if not isinstance(body, dict):
             raise ElectrumError("Fulcrum returned an unexpected message")
+        # One request per connection, so a mismatched id means the answer
+        # belongs to some other request and must not be handed to this tool.
+        if body.get("id") != 1:
+            raise ElectrumError("Fulcrum answered a different request")
         error = body.get("error")
         if error:
             if isinstance(error, dict):

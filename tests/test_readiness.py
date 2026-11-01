@@ -85,6 +85,23 @@ async def test_ready_probes_again_after_the_ttl(fake_client, monkeypatch) -> Non
 
 
 @pytest.mark.anyio
+async def test_an_unready_answer_is_cached_then_replaced(fake_client, monkeypatch) -> None:
+    fake_client.answers["blockchain.headers.subscribe"] = ElectrumError("down")
+    _, status = await server._readiness()
+    assert status == 503
+    _, status = await server._readiness()
+    assert status == 503
+    assert len(fake_client.calls) == 1
+
+    monkeypatch.setattr(server, "READY_CACHE_TTL", 0.0)
+    fake_client.answers["blockchain.headers.subscribe"] = {"height": 0, "hex": GENESIS_HEADER}
+    body, status = await server._readiness()
+    assert status == 200
+    assert body["status"] == "ready"
+    assert len(fake_client.calls) == 2
+
+
+@pytest.mark.anyio
 async def test_concurrent_ready_requests_share_one_probe(fake_client) -> None:
     def slow(_params):
         time.sleep(0.05)

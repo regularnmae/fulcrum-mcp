@@ -47,14 +47,14 @@ async def _receive() -> dict[str, Any]:
 
 
 async def _call(
-    app: _StubApp, scope: dict[str, Any]
+    app: _StubApp, scope: dict[str, Any], token: str | None = TOKEN
 ) -> tuple[int, dict[bytes, bytes], bytes]:
     messages: list[dict[str, Any]] = []
 
     async def send(message: dict[str, Any]) -> None:
         messages.append(message)
 
-    middleware = server.BearerAuthMiddleware(app, TOKEN)
+    middleware = server.BearerAuthMiddleware(app, token)
     await middleware(scope, _receive, send)
     start = next(m for m in messages if m["type"] == "http.response.start")
     body = b"".join(
@@ -131,3 +131,31 @@ async def test_the_mcp_endpoint_forwards_a_valid_token() -> None:
     assert status == 200
     assert body == b"app"
     assert app.called
+
+
+@pytest.mark.anyio
+async def test_ready_answers_a_head_without_a_body(fake_client) -> None:
+    fake_client.answers["blockchain.headers.subscribe"] = {
+        "height": 0,
+        "hex": GENESIS_HEADER,
+    }
+    status, _, body = await _call(_StubApp(), _scope("/ready", "HEAD"))
+    assert status == 200
+    assert body == b""
+    assert len(fake_client.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_anonymous_mode_serves_without_a_token(monkeypatch) -> None:
+    monkeypatch.setattr(server, "MCP_ALLOW_ANONYMOUS", True)
+    app = _StubApp()
+    status, _, body = await _call(app, _scope("/mcp"), token=None)
+    assert status == 200
+    assert body == b"app"
+    assert app.called
+
+
+def test_a_missing_token_refuses_to_start(monkeypatch) -> None:
+    monkeypatch.setattr(server, "MCP_ALLOW_ANONYMOUS", False)
+    with pytest.raises(RuntimeError):
+        server.BearerAuthMiddleware(_StubApp(), None)

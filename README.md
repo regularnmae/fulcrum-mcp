@@ -55,7 +55,9 @@ transaction, output and address. Two consequences shape this server:
 The protocol has a subscription model, but this server does not use it: every
 call opens a connection, negotiates `server.version` (`1.4`), asks one
 question and closes. Nothing is pushed to the client, and no state is kept
-between calls.
+between calls. At most eight calls are in flight at once; a caller beyond that
+waits five seconds for a slot and is then shed with an error, so a fan-out
+cannot open an unbounded number of sockets on the indexer.
 
 `get_transaction` reads Fulcrum's index rather than asking the node, so it
 resolves a confirmed transaction even when `bitcoind` runs with `txindex=0`
@@ -88,9 +90,11 @@ seconds, so a poller cannot turn one unauthenticated request into one
 connection to the indexer. Both paths answer `GET` and `HEAD`; any other
 method is a `405`.
 
-Keep the container healthcheck on `/health`. `/ready` stays `503` while
-Fulcrum syncs or is down, so gating podman on it would restart this server in
-a loop instead of reporting the indexer's state.
+Keep the container healthcheck off `/ready`: `healthcheck.py` probes `/mcp`
+with an authenticated initialize, which tests the process and the endpoint
+without touching Fulcrum. `/ready` stays `503` while Fulcrum syncs or is down,
+so gating podman on it would restart this server in a loop instead of
+reporting the indexer's state.
 
 ### Configuration
 
@@ -133,7 +137,7 @@ Dependencies are managed with [uv](https://docs.astral.sh/uv/) from
 `pyproject.toml`; `uv.lock` is the exact closure (versions *and* hashes).
 
 ```sh
-uv run pytest -q                # 75 tests, ~0.3s, no network
+uv run pytest -q                # 82 tests, ~0.4s, no network
 uv run ruff check .             # lint
 uv run pyright                  # typecheck
 uv run python scripts/smoke.py  # boots the real app on loopback

@@ -9,6 +9,7 @@ per request, an error object named with its code, and every failure mode
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -121,6 +122,35 @@ def test_a_non_json_line_is_named(monkeypatch) -> None:
     assert "non-JSON" in excinfo.value.message
 
 
+def test_a_response_for_another_id_is_refused(monkeypatch) -> None:
+    _install(monkeypatch, [HANDSHAKE, b'{"id":2,"result":1}\n'])
+    with pytest.raises(ElectrumError) as excinfo:
+        ElectrumClient(URL).call("server.features")
+    assert "different request" in excinfo.value.message
+
+
+def test_a_call_is_shed_when_every_slot_is_busy(monkeypatch) -> None:
+    monkeypatch.setattr(electrum_module, "CALL_SLOT_TIMEOUT", 0.0)
+    client = ElectrumClient(URL)
+    client._slots = threading.BoundedSemaphore(1)
+    assert client._slots.acquire(blocking=False)
+    try:
+        with pytest.raises(ElectrumError) as excinfo:
+            client.call("server.features")
+    finally:
+        client._slots.release()
+    assert "busy" in excinfo.value.message
+
+
+def test_a_failed_call_releases_its_slot(monkeypatch) -> None:
+    _install(monkeypatch, [], connect_error=ConnectionRefusedError(111, "refused"))
+    client = ElectrumClient(URL)
+    with pytest.raises(ElectrumError):
+        client.call("server.features")
+    assert client._slots.acquire(blocking=False)
+    client._slots.release()
+
+
 def test_a_refused_connection_is_named(monkeypatch) -> None:
     _install(monkeypatch, [], connect_error=ConnectionRefusedError(111, "refused"))
     with pytest.raises(ElectrumError) as excinfo:
@@ -138,6 +168,9 @@ def test_a_read_timeout_is_named(monkeypatch) -> None:
 def test_url_parsing_covers_both_schemes() -> None:
     assert parse_url("tcp://fulcrum:50001")[2:] == (50001, False)
     assert parse_url("ssl://fulcrum:50002")[2:] == (50002, True)
+    # The protocol's default ports when the URL leaves the port out.
+    assert parse_url("tcp://fulcrum")[2:] == (50001, False)
+    assert parse_url("ssl://fulcrum")[2:] == (50002, True)
     with pytest.raises(ValueError):
         parse_url("http://fulcrum:50001")
     with pytest.raises(ValueError):

@@ -11,8 +11,9 @@ requires-python = ">=3.12"
 # closure with hashes; the image installs from a hash-verified export of it.
 dependencies = [
     "mcp>=2.3.0",
-    # Pulled in transitively by mcp, but server.py imports it directly,
-    # so it is declared rather than borrowed.
+    # Both are pulled in transitively by mcp, but server.py imports them
+    # directly, so they are declared rather than borrowed.
+    "pydantic>=2.14.2",
     "uvicorn>=0.31.1",
 ]
 

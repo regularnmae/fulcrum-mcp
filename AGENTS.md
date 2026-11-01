@@ -22,7 +22,7 @@ them from the code.
 ```sh
 uv run ruff check .            # lint (CI gate). No `ruff format`; line-length 100, rules E,F,I,UP,B,SIM
 uv run pyright                 # typecheck (CI gate); include list in [tool.pyright]
-uv run pytest -q               # 75 tests, ~0.3s, no network
+uv run pytest -q               # 82 tests, ~0.4s, no network
 uv run python scripts/smoke.py # boots the real app on loopback: /health, /ready, 401s, handshake
 uv add <pkg>                   # edits pyproject.toml AND re-locks — commit the uv.lock change
 uv lock --check                # CI drift gate
@@ -49,9 +49,11 @@ waits for "(healthy)"; `./deploy.sh` deploys the whole stack. The unit and
   asks one question and closes. There are no subscriptions: MCP is
   request/response, so `blockchain.scripthash.subscribe` and friends are out
   of scope, and no state is kept between calls. A response line is capped at
-  `MAX_RESPONSE_BYTES` (8 MiB), and only a reset/aborted connect is retried.
+  `MAX_RESPONSE_BYTES` (8 MiB), only a reset/aborted connect is retried, and at
+  most `MAX_CONCURRENT_CALLS` (8) calls are in flight at once.
 - Tool bodies are synchronous (`def`, not `async def`); anyio runs them on
-  worker threads. `ElectrumClient` is stateless per call, so that is safe.
+  worker threads. `ElectrumClient` keeps no protocol state between calls (only
+  a semaphore bounding concurrent sockets), so that is safe.
 - Every `@mcp.tool` passes `structured_output=False` and
   `annotations=_INDEX_TOOLS`; `tests/test_schemas.py` asserts this and the
   exact set of tool names — adding a tool means updating `TOOLS` there.
@@ -73,8 +75,9 @@ waits for "(healthy)"; `./deploy.sh` deploys the whole stack. The unit and
   open and answers exactly `{"status":"ok"}`. `/ready` is also open and probes
   Fulcrum (`200` with height and blockhash, `503` when it does not answer, 2s
   timeout), cached for `READY_CACHE_TTL` (5s) because the path is open. Both
-  answer `GET`/`HEAD` only and `405` anything else; the podman healthcheck must
-  stay on `/health`, or a syncing indexer restart-loops the container.
+  answer `GET`/`HEAD` only and `405` anything else. The podman healthcheck is
+  `healthcheck.py` against `/mcp` (an authenticated initialize) and must not be
+  moved to `/ready`, or a syncing indexer restart-loops the container.
 - The bearer-token env var is **`FULCRUM_MCP_TOKEN`**, not a shared name: each
   sibling server has its own token.
 
